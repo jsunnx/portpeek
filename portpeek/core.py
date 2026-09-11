@@ -350,6 +350,9 @@ PROTECTED_NAMES = {
 
 def is_protected_process(entry: PortEntry) -> bool:
     """True if this listener must not be killed by default."""
+    # PID 0 is never a killable user process (Idle on Windows, swapper/null on Linux)
+    if entry.pid == 0:
+        return True
     if sys.platform == "win32" and entry.pid in PROTECTED_PIDS_WIN:
         return True
     name = (entry.process_name or "").strip().lower()
@@ -360,7 +363,6 @@ def is_protected_process(entry: PortEntry) -> bool:
         name = name[:-4]
     if name in PROTECTED_NAMES:
         return True
-    # lsass.exe etc already stripped; also match "System" from netstat
     return False
 
 
