@@ -54,11 +54,11 @@ Requires Python **3.9+**.
 
 | OS | How it reads ports |
 |----|--------------------|
-| **Windows** (primary) | `netstat -ano` + PowerShell process map |
-| Linux | `ss -tulnp` + `/proc` |
-| macOS | `lsof` |
+| **Windows** (primary, tested) | `netstat -ano` + PowerShell process map |
+| Linux | `ss -tulnp` + `/proc` (best-effort, less tested) |
+| macOS | `lsof` (best-effort, less tested) |
 
-Windows is fully supported. Linux/macOS are best-effort.
+If you only care about Windows, it is fully supported. POSIX paths are community-grade.
 
 ---
 
@@ -73,10 +73,22 @@ portpeek --free              # print a free TCP port (from 3000)
 portpeek --free 8000         # free port starting search at 8000
 portpeek --watch 2           # poll until the port state changes
 portpeek --all               # include non-LISTEN states
-portpeek --json              # ASCII-safe JSON
+portpeek --json              # JSON (UTF-8 bytes on stdout)
+portpeek --json -o ports.json  # write UTF-8 JSON file (safe for scripts)
 portpeek 3000 --kill         # terminate listening holders only
 portpeek 3000 --kill --force
 portpeek --no-color          # plain text (CI / pipes)
+```
+
+### JSON / redirect notes (Windows)
+
+- Prefer `portpeek --json -o out.json` — writes UTF-8 with no BOM.
+- PowerShell 5.1 `>` re-encodes text to UTF-16. For byte-faithful redirect use:
+
+```powershell
+cmd /c "python -m portpeek --json > out.json"
+# or
+python -m portpeek --json -o out.json
 ```
 
 ### Kill semantics

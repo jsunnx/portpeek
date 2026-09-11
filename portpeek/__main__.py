@@ -27,6 +27,29 @@ def _force_utf8_stdout() -> None:
         pass
 
 
+def _emit(text: str, force_utf8: bool = False) -> None:
+    """Print text; when force_utf8 (JSON/machine output), write raw UTF-8 bytes.
+
+    PowerShell `>` re-encodes text streams to UTF-16 — use --output for files,
+    or cmd.exe redirection for portable bytes.
+    """
+    data = (text if text.endswith("\n") else text + "\n").encode("utf-8")
+    if force_utf8:
+        try:
+            buf = getattr(sys.stdout, "buffer", None)
+            if buf is not None:
+                buf.write(data)
+                buf.flush()
+                return
+        except Exception:
+            pass
+    # Human table: decode for text stdout
+    try:
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+    except Exception:
+        print(text)
+
+
 def _use_color() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
@@ -204,6 +227,12 @@ def main(argv: list[str] | None = None) -> int:
         help="disable ANSI colors",
     )
     parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="write JSON/text result to FILE as UTF-8 (avoids PowerShell redirect issues)",
+    )
+    parser.add_argument(
         "-v",
         "--version",
         action="version",
@@ -214,6 +243,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_color:
         _C.update({"g": "", "y": "", "d": "", "r": "", "b": "", "e": ""})
 
+    def emit(text: str, machine: bool = False) -> None:
+        if args.output:
+            with open(args.output, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
+            if not machine:
+                print(f"Wrote {args.output}")
+            return
+        _emit(text, force_utf8=machine)
+
     listen_only = not args.all
 
     if args.free is not None:
@@ -221,10 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         if port is None:
             print(f"No free port found in [{args.free}, {args.free + 5000}).")
             return 1
-        if args.json:
-            print(port)
-        else:
-            print(port)
+        emit(str(port), machine=args.json or bool(args.output))
         return 0
 
     if args.watch is not None:
@@ -285,8 +320,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pid is not None:
         entries = find_by_pid(args.pid, listen_only=listen_only)
-        if args.json:
-            print(entries_to_json(entries))
+        if args.json or args.output:
+            emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
         if not entries:
             print(f"PID {args.pid} holds no ports (in this view).")
@@ -297,8 +332,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.name is not None:
         entries = find_by_name(args.name, listen_only=listen_only)
-        if args.json:
-            print(entries_to_json(entries))
+        if args.json or args.output:
+            emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
         if not entries:
             print(f"No process matching '{args.name}'.")
@@ -309,8 +344,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.port is not None:
         entries = find_port(args.port, listen_only=listen_only)
-        if args.json:
-            print(entries_to_json(entries))
+        if args.json or args.output:
+            emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
         if not entries:
             print(f"Port {args.port} is not in use (or not listening).")
@@ -324,8 +359,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     entries = list_ports(listen_only=listen_only)
-    if args.json:
-        print(entries_to_json(entries))
+    if args.json or args.output:
+        emit(entries_to_json(entries), machine=True)
         return 0
     title = "Listening ports" if listen_only else "All connections"
     print(f"{title} · {len(entries)}\n" if entries else "")
