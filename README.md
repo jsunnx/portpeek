@@ -39,6 +39,12 @@ On Windows, this loop is familiar:
 ## Install
 
 ```bash
+pip install portpeek
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/jsunnx/portpeek.git
 cd portpeek
 pip install -e .
