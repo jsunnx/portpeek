@@ -3,8 +3,15 @@ from __future__ import annotations
 
 import unittest
 
-from portpeek.core import _split_host_port, _WIN_TCP, _WIN_UDP, _SS_LINE
-from portpeek.core import PortEntry, entries_to_json
+from portpeek.core import (
+    PortEntry,
+    _split_host_port,
+    _WIN_TCP,
+    _WIN_UDP,
+    _SS_LINE,
+    is_protected_process,
+    entries_to_json,
+)
 
 
 class TestWindowsParse(unittest.TestCase):
@@ -40,18 +47,36 @@ class TestWindowsParse(unittest.TestCase):
     def test_json_ascii_safe(self):
         e = PortEntry("UDP", "0.0.0.0", 443, 1, "LISTENING", process_name="微信")
         s = entries_to_json([e])
-        self.assertNotIn("微", s)  # escaped
+        self.assertNotIn("微", s)
         self.assertIn("\\u", s)
 
     def test_ss_udp_listen(self):
         line = (
-            'udp   UNCONN 0      0      0.0.0.0:68          0.0.0.0:*    '
+            "udp   UNCONN 0      0      0.0.0.0:68          0.0.0.0:*    "
             'users:(("dhclient",pid=456,fd=6))'
         )
         m = _SS_LINE.match(line.strip())
         self.assertIsNotNone(m)
         self.assertEqual(m.group("netid").lower(), "udp")
         self.assertEqual(m.group("state").upper(), "UNCONN")
+
+
+class TestProtected(unittest.TestCase):
+    def test_system_pid(self):
+        e = PortEntry("TCP", "0.0.0.0", 80, 4, "LISTENING", process_name="System")
+        self.assertTrue(is_protected_process(e))
+
+    def test_lsass(self):
+        e = PortEntry("TCP", "0.0.0.0", 10496, 1648, "LISTENING", process_name="lsass")
+        self.assertTrue(is_protected_process(e))
+
+    def test_node_not_protected(self):
+        e = PortEntry("TCP", "127.0.0.1", 3000, 123, "LISTENING", process_name="node")
+        self.assertFalse(is_protected_process(e))
+
+    def test_pid0(self):
+        e = PortEntry("TCP", "0.0.0.0", 1, 0, "LISTENING", process_name="")
+        self.assertTrue(is_protected_process(e))
 
 
 if __name__ == "__main__":

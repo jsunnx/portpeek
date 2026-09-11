@@ -13,6 +13,7 @@ from .core import (
     find_by_name,
     find_by_pid,
     find_port,
+    is_protected_process,
     kill_port,
     list_ports,
     next_free_port,
@@ -197,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
         help="with --kill, force terminate",
     )
     parser.add_argument(
+        "--unsafe",
+        action="store_true",
+        help="with --kill, allow terminating protected OS processes (dangerous)",
+    )
+    parser.add_argument(
         "--pid",
         type=int,
         metavar="PID",
@@ -296,24 +302,46 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Terminating listening process(es) on port {args.port}...")
         for e in before:
             name = e.process_name or "?"
-            print(f"  PID {e.pid}  {name}")
-        results = kill_port(args.port, force=args.force)
+            tag = " [protected]" if is_protected_process(e) else ""
+            print(f"  PID {e.pid}  {name}{tag}")
+        results = kill_port(args.port, force=args.force, unsafe=args.unsafe)
         failed = 0
-        for _, ok, msg in results:
+        skipped = 0
+        killed = 0
+        for entry, ok, msg in results:
+            if "protected process skipped" in msg:
+                skipped += 1
+                print(f"  skip  {msg}")
+                continue
             if ok:
+                killed += 1
                 print(f"  ok  {msg}")
             else:
                 failed += 1
                 print(f"  fail  {_admin_hint(msg)}")
         after = find_port(args.port, listen_only=True)
-        if after and failed == 0:
+        # If only protected holders remain, that's expected
+        remaining_listening = after
+        remaining_killable = [e for e in after if not is_protected_process(e)]
+        if skipped and not remaining_killable and failed == 0:
+            print(
+                f"Port {args.port} still held by protected process(es). "
+                f"Use --unsafe --kill only if you know what you are doing."
+            )
+            return 1
+        if remaining_killable and killed == 0 and failed == 0 and not skipped:
             print("Terminate requested; if still listening, try --force")
             return 0
-        if after:
+        if remaining_killable and (failed or killed):
             print(
                 f"Port {args.port} is still listening. "
                 f"Try: portpeek {args.port} --kill --force"
             )
+            return 1
+        if not remaining_listening:
+            print(f"Port {args.port} is free.")
+            return 0
+        if skipped and not remaining_killable:
             return 1
         print(f"Port {args.port} is free.")
         return 0

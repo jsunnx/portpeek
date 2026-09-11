@@ -335,6 +335,42 @@ def find_by_name(name: str, listen_only: bool = True) -> list[PortEntry]:
     return out
 
 
+# Critical OS processes — never taskkill by default
+PROTECTED_PIDS_WIN = {0, 4}  # Idle, System
+PROTECTED_NAMES = {
+    "system",
+    "registry",
+    "smss",
+    "csrss",
+    "wininit",
+    "winlogon",
+    "services",
+    "lsass",
+    "memcompression",
+    "memory compression",
+    "idle",
+    "system idle process",
+    "fontdrvhost",
+    "dwm",
+}
+
+
+def is_protected_process(entry: PortEntry) -> bool:
+    """True if this listener must not be killed by default."""
+    if sys.platform == "win32" and entry.pid in PROTECTED_PIDS_WIN:
+        return True
+    name = (entry.process_name or "").strip().lower()
+    if not name:
+        # path basename fallback
+        name = (entry.exe_path or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name in PROTECTED_NAMES:
+        return True
+    # lsass.exe etc already stripped; also match "System" from netstat
+    return False
+
+
 def next_free_port(start: int = 3000, end: int = 10000) -> int | None:
     """First free TCP port in [start, end). None if none free."""
     import socket
@@ -351,39 +387,58 @@ def next_free_port(start: int = 3000, end: int = 10000) -> int | None:
     return None
 
 
-def kill_port(port: int, force: bool = False) -> list[tuple[PortEntry, bool, str]]:
-    """Return list of (entry, ok, message). Only kills listening holders."""
+def _taskkill(pid: int, force: bool) -> tuple[bool, str]:
+    if force:
+        args = ["taskkill", "/F", "/T", "/PID", str(pid)]
+    else:
+        args = ["taskkill", "/T", "/PID", str(pid)]
+    completed = subprocess.run(
+        args,
+        capture_output=True,
+        creationflags=0x08000000 if sys.platform == "win32" else 0,
+        check=False,
+    )
+    ok = completed.returncode == 0
+    msg = (_decode(completed.stdout) or _decode(completed.stderr) or "").strip()
+    first = msg.splitlines()[0] if msg else ("ok" if ok else "failed")
+    return ok, first
+
+
+def kill_port(
+    port: int,
+    force: bool = False,
+    unsafe: bool = False,
+) -> list[tuple[PortEntry, bool, str]]:
+    """Kill listening holders. Skips protected OS processes unless unsafe=True.
+
+    Returns list of (entry, ok, message).
+    """
     results: list[tuple[PortEntry, bool, str]] = []
     hits = find_port(port, listen_only=True)
     if not hits:
         return results
-    # Prefer real listening PIDs; skip pid 0 (system/unknown on some OS)
-    pids = sorted({e.pid for e in hits if e.pid})
-    if not pids:
+
+    # Group by pid, keep one representative entry per pid
+    by_pid: dict[int, PortEntry] = {}
+    for e in hits:
+        if e.pid:
+            by_pid.setdefault(e.pid, e)
+    if not by_pid:
         return results
 
-    for pid in pids:
-        if sys.platform == "win32":
-            # /T kills the process tree so orphans don't keep the port
-            if force:
-                args = ["taskkill", "/F", "/T", "/PID", str(pid)]
-            else:
-                args = ["taskkill", "/T", "/PID", str(pid)]
-            creationflags = 0x08000000
-            completed = subprocess.run(
-                args,
-                capture_output=True,
-                creationflags=creationflags,
-                check=False,
-            )
-            ok = completed.returncode == 0
-            msg = (_decode(completed.stdout) or _decode(completed.stderr) or "").strip()
-            first = msg.splitlines()[0] if msg else ("ok" if ok else "failed")
-            if not ok and ("denied" in first.lower() or "拒绝" in first or "access" in first.lower()):
-                first = f"{first} (try running as Administrator)"
+    for pid, entry in sorted(by_pid.items()):
+        if is_protected_process(entry) and not unsafe:
             results.append(
-                (PortEntry("", "", port, pid, ""), ok, first)
+                (entry, False, f"protected process skipped (PID {pid} {entry.process_name or '?'})")
             )
+            continue
+        if sys.platform == "win32":
+            ok, first = _taskkill(pid, force)
+            if not ok:
+                low = first.lower()
+                if "denied" in low or "拒绝" in first or "access" in low:
+                    first = f"{first} — try running as Administrator"
+            results.append((PortEntry("", "", port, pid, ""), ok, first))
         else:
             args = ["kill", "-9" if force else "-15", str(pid)]
             completed = subprocess.run(args, capture_output=True, check=False)
@@ -396,7 +451,6 @@ def kill_port(port: int, force: bool = False) -> list[tuple[PortEntry, bool, str
 
 
 def entries_to_json(entries: list[PortEntry]) -> str:
-    # ensure_ascii=True so redirected stdout on Windows (GBK) cannot corrupt JSON
     return json.dumps(
         [asdict(e) for e in entries],
         ensure_ascii=True,

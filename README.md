@@ -77,8 +77,18 @@ portpeek --json              # JSON (UTF-8 bytes on stdout)
 portpeek --json -o ports.json  # write UTF-8 JSON file (safe for scripts)
 portpeek 3000 --kill         # terminate listening holders only
 portpeek 3000 --kill --force
+portpeek 3000 --kill --unsafe  # allow killing protected OS processes (dangerous)
 portpeek --no-color          # plain text (CI / pipes)
 ```
+
+### System process protection
+
+`--kill` **never** targets critical OS processes by default:
+
+`System` (PID 4), `Idle`, `lsass`, `csrss`, `smss`, `wininit`, `winlogon`, `services`, `Registry`, `Memory Compression`, `dwm`, …
+
+If only a protected process holds the port, you get a clear skip message.  
+Override only with `--unsafe` (combine with `--force` if needed) — you can blue-screen or lock yourself out. Don't.
 
 ### JSON / redirect notes (Windows)
 
