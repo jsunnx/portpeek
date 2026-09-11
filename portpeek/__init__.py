@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""portpeek — Windows 端口占用速查"""
+"""portpeek — see who occupies a port and free it."""
 
 from .core import PortEntry, list_ports, kill_port, find_port
 
