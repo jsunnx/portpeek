@@ -21,25 +21,43 @@ class PortEntry:
     exe_path: str = ""
 
 
-_NETSTAT_LINE = re.compile(
-    r"^(?P<proto>\S+)\s+"
+# Windows TCP: Proto Local Foreign State PID
+_WIN_TCP = re.compile(
+    r"^(?P<proto>TCP(?:v6)?)\s+"
     r"(?P<local>\S+)\s+"
     r"(?P<remote>\S+)\s+"
     r"(?P<state>\S+)\s+"
-    r"(?P<pid>\d+)\s*$"
+    r"(?P<pid>\d+)\s*$",
+    re.IGNORECASE,
 )
 
+# Windows UDP: Proto Local Foreign PID  (no State column)
+_WIN_UDP = re.compile(
+    r"^(?P<proto>UDP(?:v6)?)\s+"
+    r"(?P<local>\S+)\s+"
+    r"(?P<remote>\S+)\s+"
+    r"(?P<pid>\d+)\s*$",
+    re.IGNORECASE,
+)
 
-def _run_netstat() -> str:
-    creationflags = 0x08000000 if sys.platform == "win32" else 0
-    raw = subprocess.run(
-        ["netstat", "-ano"],
-        capture_output=True,
-        creationflags=creationflags,
-        check=False,
-    )
-    data = raw.stdout
-    for enc in ("utf-8", "gbk", "cp936", "latin-1"):
+# Linux ss: netid state recvq sendq local peer [users:(("name",pid=N,...))]
+_SS_LINE = re.compile(
+    r"^(?P<netid>tcp|udp|tcp6|udp6)\s+"
+    r"(?P<state>\S+)\s+"
+    r"(?P<recvq>\d+)\s+"
+    r"(?P<sendq>\d+)\s+"
+    r"(?P<local>\S+)\s+"
+    r"(?P<peer>\S+)"
+    r"(?:\s+users:\(\((?P<users>.+)\)\))?\s*$",
+    re.IGNORECASE,
+)
+
+_SS_USER_PID = re.compile(r'pid=(\d+)')
+_SS_USER_NAME = re.compile(r'\(\"([^\"]+)\"')
+
+
+def _decode(data: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1"):
         try:
             return data.decode(enc)
         except UnicodeDecodeError:
@@ -47,63 +65,186 @@ def _run_netstat() -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _parse_netstat() -> list[PortEntry]:
-    text = _run_netstat()
+def _hidden_run(cmd: list[str]) -> tuple[int, str]:
+    creationflags = 0x08000000 if sys.platform == "win32" else 0
+    raw = subprocess.run(
+        cmd,
+        capture_output=True,
+        creationflags=creationflags,
+        check=False,
+    )
+    return raw.returncode, _decode(raw.stdout)
+
+
+def _split_host_port(addr: str) -> tuple[str, int] | None:
+    if not addr or addr == "*:*":
+        return None
+    if addr.startswith("["):
+        # [::]:8080 or [::1]:8080
+        close = addr.find("]")
+        if close < 0 or close + 1 >= len(addr) or addr[close + 1] != ":":
+            return None
+        host = addr[: close + 1]
+        port_s = addr[close + 2 :]
+    else:
+        host, _, port_s = addr.rpartition(":")
+    if not port_s.isdigit():
+        return None
+    return host, int(port_s)
+
+
+def _parse_windows_netstat() -> list[PortEntry]:
+    _, text = _hidden_run(["netstat", "-ano"])
     entries: list[PortEntry] = []
     for line in text.splitlines():
         line = line.strip()
-        m = _NETSTAT_LINE.match(line)
+        if not line:
+            continue
+        mt = _WIN_TCP.match(line)
+        if mt:
+            hp = _split_host_port(mt.group("local"))
+            if not hp:
+                continue
+            host, port = hp
+            entries.append(
+                PortEntry(
+                    proto=mt.group("proto").upper(),
+                    local_addr=host,
+                    port=port,
+                    pid=int(mt.group("pid")),
+                    state=mt.group("state").upper(),
+                )
+            )
+            continue
+        mu = _WIN_UDP.match(line)
+        if mu:
+            hp = _split_host_port(mu.group("local"))
+            if not hp:
+                continue
+            host, port = hp
+            # Windows UDP has no State; treat bound socket as listening
+            entries.append(
+                PortEntry(
+                    proto=mu.group("proto").upper(),
+                    local_addr=host,
+                    port=port,
+                    pid=int(mu.group("pid")),
+                    state="LISTENING",
+                )
+            )
+    return entries
+
+
+def _parse_linux_ss() -> list[PortEntry]:
+    _, text = _hidden_run(["ss", "-tulnp"])
+    entries: list[PortEntry] = []
+    for line in text.splitlines():
+        line = line.strip()
+        m = _SS_LINE.match(line)
         if not m:
             continue
-        proto = m.group("proto").upper()
-        local = m.group("local")
+        netid = m.group("netid").upper()
         state = m.group("state").upper()
-        if ":" not in local:
+        # LISTEN for TCP; UNCONN is normal for UDP listeners
+        if netid.startswith("TCP") and state not in {"LISTEN", "LISTENING"}:
             continue
-        addr, _, port_s = local.rpartition(":")
-        if not port_s.isdigit():
+        if netid.startswith("UDP") and state not in {"UNCONN", "UNCONNECTED", "LISTEN", "LISTENING"}:
             continue
+        local = m.group("local")
+        # ss may show *:22 or 0.0.0.0:22 or [::]:22
+        if local.startswith("["):
+            hp = _split_host_port(local)
+        elif ":" not in local:
+            continue
+        else:
+            hp = _split_host_port(local)
+        if not hp:
+            continue
+        host, port = hp
+        pid = 0
+        name = ""
+        users = m.group("users") or ""
+        pm = _SS_USER_PID.search(users)
+        if pm:
+            pid = int(pm.group(1))
+        nm = _SS_USER_NAME.search(users)
+        if nm:
+            name = nm.group(1)
         entries.append(
             PortEntry(
-                proto=proto,
-                local_addr=addr,
-                port=int(port_s),
-                pid=int(m.group("pid")),
-                state=state,
+                proto="UDP" if netid.startswith("UDP") else "TCP",
+                local_addr=host,
+                port=port,
+                pid=pid,
+                state="LISTENING",
+                process_name=name,
             )
         )
     return entries
 
 
+def _parse_macos_lsof() -> list[PortEntry]:
+    entries: list[PortEntry] = []
+    # TCP listeners
+    _, tcp_text = _hidden_run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
+    # UDP
+    _, udp_text = _hidden_run(["lsof", "-nP", "-iUDP"])
+    for proto, text in (("TCP", tcp_text), ("UDP", udp_text)):
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 9:
+                continue
+            # NAME column often like *:8080 or 127.0.0.1:8080
+            name = parts[8]
+            if ":" not in name:
+                continue
+            hp = _split_host_port(name)
+            if not hp:
+                continue
+            host, port = hp
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            entries.append(
+                PortEntry(
+                    proto=proto,
+                    local_addr=host,
+                    port=port,
+                    pid=pid,
+                    state="LISTENING",
+                    process_name=parts[0],
+                )
+            )
+    return entries
+
+
+def _parse_system() -> list[PortEntry]:
+    if sys.platform == "win32":
+        return _parse_windows_netstat()
+    if sys.platform == "darwin":
+        return _parse_macos_lsof()
+    # Linux and other POSIX
+    return _parse_linux_ss()
+
+
 def _process_map(pids: Iterable[int]) -> dict[int, tuple[str, str]]:
     info: dict[int, tuple[str, str]] = {}
-    wanted = set(pids)
+    wanted = {p for p in pids if p}
     if not wanted:
         return info
+
     if sys.platform == "win32":
-        creationflags = 0x08000000
         cmd = (
             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
             "$OutputEncoding=[System.Text.Encoding]::UTF8; "
             "Get-Process | Select-Object Id,ProcessName,Path | "
             "ConvertTo-Json -Compress"
         )
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            capture_output=True,
-            creationflags=creationflags,
-            check=False,
+        _, raw = _hidden_run(
+            ["powershell", "-NoProfile", "-Command", cmd]
         )
-        raw_bytes = completed.stdout
-        raw = None
-        for enc in ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1"):
-            try:
-                raw = raw_bytes.decode(enc).strip()
-                break
-            except UnicodeDecodeError:
-                continue
-        if raw is None:
-            raw = raw_bytes.decode("utf-8", errors="replace").strip()
+        raw = raw.strip()
         if raw:
             try:
                 data = json.loads(raw)
@@ -116,17 +257,24 @@ def _process_map(pids: Iterable[int]) -> dict[int, tuple[str, str]]:
                     pid = int(item.get("Id") or 0)
                     name = str(item.get("ProcessName") or "")
                     path = str(item.get("Path") or "")
-                    if pid:
+                    if pid in wanted:
                         info[pid] = (name, path)
         return info
 
-    # POSIX fallback
     for pid in wanted:
-        try:
-            name = os.readlink(f"/proc/{pid}/exe")
-        except OSError:
-            name = ""
-        info[pid] = (os.path.basename(name) if name else "", name)
+        name = ""
+        path = ""
+        if sys.platform.startswith("linux"):
+            try:
+                path = os.readlink(f"/proc/{pid}/exe")
+                name = os.path.basename(path)
+            except OSError:
+                name = ""
+        else:
+            # macOS / other
+            _, out = _hidden_run(["ps", "-p", str(pid), "-o", "comm="])
+            name = out.strip()
+        info[pid] = (name, path)
     return info
 
 
@@ -134,27 +282,34 @@ def list_ports(
     listen_only: bool = True,
     include_pids: set[int] | None = None,
 ) -> list[PortEntry]:
-    entries = _parse_netstat()
+    entries = _parse_system()
     if listen_only:
-        entries = [e for e in entries if e.state in {"LISTENING", "LISTEN"}]
+        entries = [
+            e
+            for e in entries
+            if e.state in {"LISTENING", "LISTEN"} or e.proto.upper().startswith("UDP")
+        ]
     if include_pids is not None:
         entries = [e for e in entries if e.pid in include_pids]
 
     pmap = _process_map(e.pid for e in entries)
     for e in entries:
         name, path = pmap.get(e.pid, ("", ""))
-        e.process_name = name
-        e.exe_path = path
-    # Deduplicate by proto/port/pid
-    seen: set[tuple[str, int, int]] = set()
+        if name:
+            e.process_name = name
+        if path:
+            e.exe_path = path
+
+    # Keep IPv4 and IPv6 as separate rows
+    seen: set[tuple[str, str, int, int]] = set()
     uniq: list[PortEntry] = []
     for e in entries:
-        key = (e.proto, e.port, e.pid)
+        key = (e.proto.upper(), e.local_addr, e.port, e.pid)
         if key in seen:
             continue
         seen.add(key)
         uniq.append(e)
-    uniq.sort(key=lambda x: (x.port, x.pid, x.proto))
+    uniq.sort(key=lambda x: (x.port, x.proto, x.local_addr, x.pid))
     return uniq
 
 
@@ -163,59 +318,51 @@ def find_port(port: int, listen_only: bool = True) -> list[PortEntry]:
 
 
 def kill_port(port: int, force: bool = False) -> list[tuple[PortEntry, bool, str]]:
-    """Return list of (entry, ok, message)."""
+    """Return list of (entry, ok, message). Only kills listening holders."""
     results: list[tuple[PortEntry, bool, str]] = []
-    hits = find_port(port, listen_only=False)
+    hits = find_port(port, listen_only=True)
     if not hits:
         return results
+    # Prefer real listening PIDs; skip pid 0 (system/unknown on some OS)
     pids = sorted({e.pid for e in hits if e.pid})
+    if not pids:
+        return results
+
     for pid in pids:
         if sys.platform == "win32":
+            # /T kills the process tree so orphans don't keep the port
             if force:
-                args = ["taskkill", "/F", "/PID", str(pid)]
+                args = ["taskkill", "/F", "/T", "/PID", str(pid)]
             else:
-                args = ["taskkill", "/PID", str(pid)]
+                args = ["taskkill", "/T", "/PID", str(pid)]
+            creationflags = 0x08000000
             completed = subprocess.run(
                 args,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=0x08000000,
+                creationflags=creationflags,
                 check=False,
             )
             ok = completed.returncode == 0
-            msg = (completed.stdout or completed.stderr or "").strip().splitlines()
+            msg = (_decode(completed.stdout) or _decode(completed.stderr) or "").strip()
+            first = msg.splitlines()[0] if msg else ("ok" if ok else "failed")
             results.append(
-                (
-                    PortEntry(
-                        proto="",
-                        local_addr="",
-                        port=port,
-                        pid=pid,
-                        state="",
-                    ),
-                    ok,
-                    msg[0] if msg else ("ok" if ok else "failed"),
-                )
+                (PortEntry("", "", port, pid, ""), ok, first)
             )
         else:
-            completed = subprocess.run(
-                ["kill", "-9" if force else "-15", str(pid)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            args = ["kill", "-9" if force else "-15", str(pid)]
+            completed = subprocess.run(args, capture_output=True, check=False)
             ok = completed.returncode == 0
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
             results.append(
-                (
-                    PortEntry("", "", port, pid, ""),
-                    ok,
-                    (completed.stderr or "ok").strip(),
-                )
+                (PortEntry("", "", port, pid, ""), ok, stderr or ("ok" if ok else "failed"))
             )
     return results
 
 
 def entries_to_json(entries: list[PortEntry]) -> str:
-    return json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2)
+    # ensure_ascii=True so redirected stdout on Windows (GBK) cannot corrupt JSON
+    return json.dumps(
+        [asdict(e) for e in entries],
+        ensure_ascii=True,
+        indent=2,
+    )
