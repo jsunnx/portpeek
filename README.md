@@ -1,10 +1,17 @@
 # portpeek
 
+[![PyPI version](https://img.shields.io/pypi/v/portpeek.svg)](https://pypi.org/project/portpeek/)
+[![Python](https://img.shields.io/pypi/pyversions/portpeek.svg)](https://pypi.org/project/portpeek/)
+[![CI](https://github.com/jsunnx/portpeek/actions/workflows/ci.yml/badge.svg)](https://github.com/jsunnx/portpeek/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Who is occupying my port 3000 / 5173 / 8080?**
 
 One command to find the process holding a port — and free it.
 
 No more hunting in Task Manager, no more `netstat -ano | findstr`.
+
+Keywords: **port killer · kill-port · EADDRINUSE · netstat · Windows · Linux · TCP · UDP · CLI**
 
 ```text
 $ portpeek 3000
@@ -33,6 +40,20 @@ On Windows, this loop is familiar:
 5. Fight admin / non-admin prompts
 
 `portpeek` does one job well: **show who holds a port, and kick it out.**
+
+---
+
+## vs other port killers
+
+| | portpeek | generic `kill-port` scripts |
+|--|----------|-----------------------------|
+| Shows **process name + path** | yes | often only PID |
+| Lists **TCP + UDP**, IPv4 + IPv6 | yes | frequently TCP-only |
+| **Protects OS processes** (lsass, System, …) | yes (`--kill` skips them) | usually no |
+| Reverse lookup `--pid` / `--name` | yes | rare |
+| Free-port picker `--free` | yes | rare |
+| Zero Python deps | yes | varies |
+| macOS / Linux best-effort | yes | sometimes |
 
 ---
 
