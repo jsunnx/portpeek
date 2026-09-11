@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 setup(
     name="portpeek",
     version="0.1.0",
-    description="Windows/Linux 端口占用速查：谁占了我的 3000/5173/8080？",
+    description="See who occupies a port and free it. Windows/Linux CLI.",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="jsunnx",

@@ -145,7 +145,7 @@ def list_ports(
         name, path = pmap.get(e.pid, ("", ""))
         e.process_name = name
         e.exe_path = path
-    # 去重：同一 proto/port/pid 只留一条
+    # Deduplicate by proto/port/pid
     seen: set[tuple[str, int, int]] = set()
     uniq: list[PortEntry] = []
     for e in entries:
