@@ -49,6 +49,8 @@ class TestWindowsParse(unittest.TestCase):
         s = entries_to_json([e])
         self.assertNotIn("微", s)
         self.assertIn("\\u", s)
+        self.assertIn('"schema_version": 1', s)
+        self.assertIn('"entries"', s)
 
     def test_ss_udp_listen(self):
         line = (
@@ -59,6 +61,11 @@ class TestWindowsParse(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m.group("netid").lower(), "udp")
         self.assertEqual(m.group("state").upper(), "UNCONN")
+        from portpeek.core import _ss_users_from_line
+
+        pid, name = _ss_users_from_line(m)
+        self.assertEqual(pid, 456)
+        self.assertEqual(name, "dhclient")
 
 
 class TestProtected(unittest.TestCase):

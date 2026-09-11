@@ -15,6 +15,7 @@ from .core import (
     find_port,
     is_protected_process,
     kill_port,
+    kill_ports,
     list_ports,
     next_free_port,
 )
@@ -29,11 +30,6 @@ def _force_utf8_stdout() -> None:
 
 
 def _emit(text: str, force_utf8: bool = False) -> None:
-    """Print text; when force_utf8 (JSON/machine output), write raw UTF-8 bytes.
-
-    PowerShell `>` re-encodes text streams to UTF-16 — use --output for files,
-    or cmd.exe redirection for portable bytes.
-    """
     data = (text if text.endswith("\n") else text + "\n").encode("utf-8")
     if force_utf8:
         try:
@@ -44,7 +40,6 @@ def _emit(text: str, force_utf8: bool = False) -> None:
                 return
         except Exception:
             pass
-    # Human table: decode for text stdout
     try:
         sys.stdout.write(data.decode("utf-8", errors="replace"))
     except Exception:
@@ -90,17 +85,22 @@ def _color_state(state: str) -> str:
     return state
 
 
-def _color_proto(proto: str) -> str:
-    if proto.upper().startswith("UDP"):
-        return f"{_C['y']}{proto}{_C['e']}"
-    return f"{_C['b']}{proto}{_C['e']}"
-
-
 def _color_process(name: str) -> str:
     low = name.lower()
     if any(k in low for k in ("node", "python", "java", "go", "deno", "bun")):
         return f"{_C['g']}{name}{_C['e']}"
     return name
+
+
+def _sort_entries(entries: list[PortEntry], key: str) -> list[PortEntry]:
+    if key == "pid":
+        return sorted(entries, key=lambda e: (e.pid, e.port, e.proto, e.local_addr))
+    if key == "name":
+        return sorted(
+            entries,
+            key=lambda e: ((e.process_name or "").lower(), e.port, e.pid),
+        )
+    return sorted(entries, key=lambda e: (e.port, e.proto, e.local_addr, e.pid))
 
 
 def _print_table(entries: list[PortEntry]) -> None:
@@ -134,9 +134,7 @@ def _print_table(entries: list[PortEntry]) -> None:
         parts = []
         for i, cell in enumerate(row):
             pad = _pad(cell, widths[i])
-            # pad after visible color codes
             if i == 0:
-                pad = _pad(cell, widths[i])
                 parts.append(f"{_C['b']}{pad}{_C['e']}")
             elif i == 3:
                 colored = _color_state(cell)
@@ -160,8 +158,67 @@ def _print_table(entries: list[PortEntry]) -> None:
 def _admin_hint(msg: str) -> str:
     low = msg.lower()
     if "denied" in low or "拒绝" in msg or "access" in low:
+        if "administrator" in low:
+            return msg
         return f"{msg} — try running as Administrator"
     return msg
+
+
+def _do_kill(ports: list[int], force: bool, unsafe: bool) -> int:
+    if not ports:
+        print("--kill requires at least one port number", file=sys.stderr)
+        return 2
+    any_live = False
+    for port in ports:
+        before = find_port(port, listen_only=True)
+        if not before:
+            print(f"No listening process found on port {port}.")
+            continue
+        any_live = True
+        print(f"Terminating listening process(es) on port {port}...")
+        for e in before:
+            name = e.process_name or "?"
+            tag = " [protected]" if is_protected_process(e) else ""
+            print(f"  PID {e.pid}  {name}{tag}")
+        results = kill_port(port, force=force, unsafe=unsafe)
+        killed = 0
+        failed = 0
+        skipped = 0
+        for entry, ok, msg in results:
+            if "protected process skipped" in msg:
+                skipped += 1
+                print(f"  skip  {msg}")
+                continue
+            if ok:
+                killed += 1
+                print(f"  ok  {msg}")
+            else:
+                failed += 1
+                print(f"  fail  {_admin_hint(msg)}")
+        after = find_port(port, listen_only=True)
+        remaining_killable = [e for e in after if not is_protected_process(e)]
+        if skipped and not remaining_killable and failed == 0:
+            print(
+                f"Port {port} still held by protected process(es). "
+                f"Use --unsafe --kill only if you know what you are doing."
+            )
+        elif remaining_killable and killed == 0 and failed == 0 and not skipped:
+            print("Terminate requested; if still listening, try --force")
+        elif remaining_killable and (failed or killed):
+            print(
+                f"Port {port} is still listening. "
+                f"Try: portpeek {port} --kill --force"
+            )
+        elif not after:
+            print(f"Port {port} is free.")
+        elif skipped and not remaining_killable:
+            pass
+        else:
+            print(f"Port {port} is free.")
+
+    if not any_live:
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -172,10 +229,11 @@ def main(argv: list[str] | None = None) -> int:
         description="See who occupies a port, and free it in one command.",
     )
     parser.add_argument(
-        "port",
-        nargs="?",
+        "ports",
+        nargs="*",
         type=int,
-        help="inspect a single port, e.g. portpeek 3000",
+        metavar="PORT",
+        help="one or more ports, e.g. portpeek 3000  3000 5173",
     )
     parser.add_argument(
         "--all",
@@ -185,12 +243,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="print JSON output",
+        help="print JSON output (schema_version=1)",
     )
     parser.add_argument(
         "--kill",
         action="store_true",
-        help="terminate the process holding the port (requires a port number)",
+        help="terminate listening holders (port numbers required)",
     )
     parser.add_argument(
         "--force",
@@ -228,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         help="poll a port every SEC seconds until state changes",
     )
     parser.add_argument(
+        "--sort",
+        choices=("port", "pid", "name"),
+        default="port",
+        help="sort table by port (default), pid, or name",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable ANSI colors",
@@ -236,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         "-o",
         "--output",
         metavar="FILE",
-        help="write JSON/text result to FILE as UTF-8 (avoids PowerShell redirect issues)",
+        help="write JSON/text result to FILE as UTF-8",
     )
     parser.add_argument(
         "-v",
@@ -269,14 +333,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.watch is not None:
-        if args.port is None:
+        if not args.ports:
             print("--watch requires a port number", file=sys.stderr)
             return 2
+        watch_port = args.ports[0]
         last = None
-        print(f"Watching port {args.port} every {args.watch}s (Ctrl+C to stop)...")
+        print(f"Watching port {watch_port} every {args.watch}s (Ctrl+C to stop)...")
         try:
             while True:
-                hits = find_port(args.port, listen_only=True)
+                hits = find_port(watch_port, listen_only=True)
                 snap = tuple(sorted((e.pid, e.process_name, e.local_addr) for e in hits))
                 if snap != last:
                     if last is not None:
@@ -289,65 +354,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     if args.kill:
-        if args.port is None:
-            print(
-                "--kill requires a port number, e.g. portpeek 3000 --kill",
-                file=sys.stderr,
-            )
-            return 2
-        before = find_port(args.port, listen_only=True)
-        if not before:
-            print(f"No listening process found on port {args.port}.")
-            return 1
-        print(f"Terminating listening process(es) on port {args.port}...")
-        for e in before:
-            name = e.process_name or "?"
-            tag = " [protected]" if is_protected_process(e) else ""
-            print(f"  PID {e.pid}  {name}{tag}")
-        results = kill_port(args.port, force=args.force, unsafe=args.unsafe)
-        failed = 0
-        skipped = 0
-        killed = 0
-        for entry, ok, msg in results:
-            if "protected process skipped" in msg:
-                skipped += 1
-                print(f"  skip  {msg}")
-                continue
-            if ok:
-                killed += 1
-                print(f"  ok  {msg}")
-            else:
-                failed += 1
-                print(f"  fail  {_admin_hint(msg)}")
-        after = find_port(args.port, listen_only=True)
-        # If only protected holders remain, that's expected
-        remaining_listening = after
-        remaining_killable = [e for e in after if not is_protected_process(e)]
-        if skipped and not remaining_killable and failed == 0:
-            print(
-                f"Port {args.port} still held by protected process(es). "
-                f"Use --unsafe --kill only if you know what you are doing."
-            )
-            return 1
-        if remaining_killable and killed == 0 and failed == 0 and not skipped:
-            print("Terminate requested; if still listening, try --force")
-            return 0
-        if remaining_killable and (failed or killed):
-            print(
-                f"Port {args.port} is still listening. "
-                f"Try: portpeek {args.port} --kill --force"
-            )
-            return 1
-        if not remaining_listening:
-            print(f"Port {args.port} is free.")
-            return 0
-        if skipped and not remaining_killable:
-            return 1
-        print(f"Port {args.port} is free.")
-        return 0
+        return _do_kill(args.ports, force=args.force, unsafe=args.unsafe)
 
     if args.pid is not None:
-        entries = find_by_pid(args.pid, listen_only=listen_only)
+        entries = _sort_entries(find_by_pid(args.pid, listen_only=listen_only), args.sort)
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
@@ -359,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.name is not None:
-        entries = find_by_name(args.name, listen_only=listen_only)
+        entries = _sort_entries(find_by_name(args.name, listen_only=listen_only), args.sort)
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
@@ -370,23 +380,40 @@ def main(argv: list[str] | None = None) -> int:
         _print_table(entries)
         return 0
 
-    if args.port is not None:
-        entries = find_port(args.port, listen_only=listen_only)
+    if len(args.ports) == 1:
+        entries = find_port(args.ports[0], listen_only=listen_only)
+        entries = _sort_entries(entries, args.sort)
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
         if not entries:
-            print(f"Port {args.port} is not in use (or not listening).")
+            print(f"Port {args.ports[0]} is not in use (or not listening).")
             return 1
-        print(f"Port {args.port} is in use:\n")
+        print(f"Port {args.ports[0]} is in use:\n")
         _print_table(entries)
         pids = sorted({e.pid for e in entries if e.pid})
-        print(f"\nTo free it: portpeek {args.port} --kill")
+        print(f"\nTo free it: portpeek {args.ports[0]} --kill")
         if sys.platform == "win32" and pids:
             print(f"Process list hint: tasklist /PID {','.join(str(p) for p in pids)}")
         return 0
 
-    entries = list_ports(listen_only=listen_only)
+    if len(args.ports) > 1:
+        collected: list[PortEntry] = []
+        for p in args.ports:
+            collected.extend(find_port(p, listen_only=listen_only))
+        collected = _sort_entries(collected, args.sort)
+        if args.json or args.output:
+            emit(entries_to_json(collected), machine=True)
+            return 0 if collected else 1
+        if not collected:
+            print("None of the given ports are listening.")
+            return 1
+        print(f"{len(args.ports)} ports requested:\n")
+        _print_table(collected)
+        print("\nTo free: portpeek " + " ".join(str(p) for p in args.ports) + " --kill")
+        return 0
+
+    entries = _sort_entries(list_ports(listen_only=listen_only), args.sort)
     if args.json or args.output:
         emit(entries_to_json(entries), machine=True)
         return 0

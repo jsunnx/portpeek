@@ -67,18 +67,32 @@ If you only care about Windows, it is fully supported. POSIX paths are community
 ```bash
 portpeek                     # list LISTEN / bound ports (TCP + UDP, IPv4 + IPv6)
 portpeek 3000                # inspect one port
+portpeek 3000 5173 8080      # inspect several ports
 portpeek --pid 1234          # reverse: which ports does this PID hold?
 portpeek --name node         # filter by process name substring
 portpeek --free              # print a free TCP port (from 3000)
 portpeek --free 8000         # free port starting search at 8000
 portpeek --watch 2           # poll until the port state changes
+portpeek --sort name         # sort by port | pid | name
 portpeek --all               # include non-LISTEN states
-portpeek --json              # JSON (UTF-8 bytes on stdout)
-portpeek --json -o ports.json  # write UTF-8 JSON file (safe for scripts)
-portpeek 3000 --kill         # terminate listening holders only
+portpeek --json              # JSON object with schema_version=1
+portpeek --json -o ports.json  # write UTF-8 JSON file
+portpeek 3000 5173 --kill    # batch free
 portpeek 3000 --kill --force
-portpeek 3000 --kill --unsafe  # allow killing protected OS processes (dangerous)
+portpeek 3000 --kill --unsafe  # allow killing protected OS processes
 portpeek --no-color          # plain text (CI / pipes)
+```
+
+JSON shape (`schema_version` is stable for scripts):
+
+```json
+{
+  "schema_version": 1,
+  "count": 2,
+  "entries": [
+    {"proto": "TCP", "local_addr": "0.0.0.0", "port": 3000, "pid": 452, "state": "LISTENING", "process_name": "node", "exe_path": "..."}
+  ]
+}
 ```
 
 ### System process protection

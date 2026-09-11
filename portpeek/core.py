@@ -52,8 +52,9 @@ _SS_LINE = re.compile(
     re.IGNORECASE,
 )
 
-_SS_USER_PID = re.compile(r'pid=(\d+)')
-_SS_USER_NAME = re.compile(r'\(\"([^\"]+)\"')
+_SS_USER_PID = re.compile(r"pid=(\d+)")
+# After _SS_LINE strips users:(( ... )), body looks like: "name",pid=456,fd=6
+_SS_USER_NAME = re.compile(r'"([^"]+)"')
 
 
 def _decode(data: bytes) -> str:
@@ -161,15 +162,7 @@ def _parse_linux_ss() -> list[PortEntry]:
         if not hp:
             continue
         host, port = hp
-        pid = 0
-        name = ""
-        users = m.group("users") or ""
-        pm = _SS_USER_PID.search(users)
-        if pm:
-            pid = int(pm.group(1))
-        nm = _SS_USER_NAME.search(users)
-        if nm:
-            name = nm.group(1)
+        pid, name = _ss_users_from_line(m)
         entries.append(
             PortEntry(
                 proto="UDP" if netid.startswith("UDP") else "TCP",
@@ -371,12 +364,26 @@ def is_protected_process(entry: PortEntry) -> bool:
     return False
 
 
+def _ss_users_from_line(m: re.Match) -> tuple[int, str]:
+    pid = 0
+    name = ""
+    users = m.group("users") or ""
+    pm = _SS_USER_PID.search(users)
+    if pm:
+        pid = int(pm.group(1))
+    nm = _SS_USER_NAME.search(users)
+    if nm:
+        name = nm.group(1)
+    return pid, name
+
+
 def next_free_port(start: int = 3000, end: int = 10000) -> int | None:
-    """First free TCP port in [start, end). None if none free."""
+    """First free TCP port in [start, end). One netstat/ss snapshot."""
     import socket
 
+    used = {e.port for e in list_ports(listen_only=True)}
     for port in range(start, end):
-        if find_port(port, listen_only=True):
+        if port in used:
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -411,14 +418,13 @@ def kill_port(
 ) -> list[tuple[PortEntry, bool, str]]:
     """Kill listening holders. Skips protected OS processes unless unsafe=True.
 
-    Returns list of (entry, ok, message).
+    Admin permission hint is applied by the CLI layer only.
     """
     results: list[tuple[PortEntry, bool, str]] = []
     hits = find_port(port, listen_only=True)
     if not hits:
         return results
 
-    # Group by pid, keep one representative entry per pid
     by_pid: dict[int, PortEntry] = {}
     for e in hits:
         if e.pid:
@@ -429,15 +435,15 @@ def kill_port(
     for pid, entry in sorted(by_pid.items()):
         if is_protected_process(entry) and not unsafe:
             results.append(
-                (entry, False, f"protected process skipped (PID {pid} {entry.process_name or '?'})")
+                (
+                    entry,
+                    False,
+                    f"protected process skipped (PID {pid} {entry.process_name or '?'})",
+                )
             )
             continue
         if sys.platform == "win32":
             ok, first = _taskkill(pid, force)
-            if not ok:
-                low = first.lower()
-                if "denied" in low or "拒绝" in first or "access" in low:
-                    first = f"{first} — try running as Administrator"
             results.append((PortEntry("", "", port, pid, ""), ok, first))
         else:
             args = ["kill", "-9" if force else "-15", str(pid)]
@@ -450,9 +456,26 @@ def kill_port(
     return results
 
 
+def kill_ports(
+    ports: list[int],
+    force: bool = False,
+    unsafe: bool = False,
+) -> list[tuple[int, PortEntry, bool, str]]:
+    """Kill multiple ports. Returns (port, entry, ok, message)."""
+    out: list[tuple[int, PortEntry, bool, str]] = []
+    for port in ports:
+        for entry, ok, msg in kill_port(port, force=force, unsafe=unsafe):
+            out.append((port, entry, ok, msg))
+    return out
+
+
 def entries_to_json(entries: list[PortEntry]) -> str:
     return json.dumps(
-        [asdict(e) for e in entries],
+        {
+            "schema_version": 1,
+            "count": len(entries),
+            "entries": [asdict(e) for e in entries],
+        },
         ensure_ascii=True,
         indent=2,
     )
