@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portpeek"
+version = "0.1.0"
+description = "Windows/Linux 端口占用速查：谁占了我的 3000/5173/8080？"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "jsunnx" }]
+keywords = ["port", "netstat", "windows", "cli", "devtools"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Topic :: System :: Networking",
+]
+
+[project.scripts]
+portpeek = "portpeek.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/jsunnx/portpeek"
+Repository = "https://github.com/jsunnx/portpeek"
+
+[tool.setuptools.packages.find]
+include = ["portpeek*"]
