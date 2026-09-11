@@ -317,6 +317,40 @@ def find_port(port: int, listen_only: bool = True) -> list[PortEntry]:
     return [e for e in list_ports(listen_only=listen_only) if e.port == port]
 
 
+def find_by_pid(pid: int, listen_only: bool = True) -> list[PortEntry]:
+    """Reverse lookup: which ports does this PID hold?"""
+    return [e for e in list_ports(listen_only=listen_only) if e.pid == pid]
+
+
+def find_by_name(name: str, listen_only: bool = True) -> list[PortEntry]:
+    """Case-insensitive substring match on process name or exe path."""
+    needle = (name or "").lower()
+    if not needle:
+        return []
+    out: list[PortEntry] = []
+    for e in list_ports(listen_only=listen_only):
+        hay = f"{e.process_name} {e.exe_path}".lower()
+        if needle in hay:
+            out.append(e)
+    return out
+
+
+def next_free_port(start: int = 3000, end: int = 10000) -> int | None:
+    """First free TCP port in [start, end). None if none free."""
+    import socket
+
+    for port in range(start, end):
+        if find_port(port, listen_only=True):
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    return None
+
+
 def kill_port(port: int, force: bool = False) -> list[tuple[PortEntry, bool, str]]:
     """Return list of (entry, ok, message). Only kills listening holders."""
     results: list[tuple[PortEntry, bool, str]] = []
@@ -345,6 +379,8 @@ def kill_port(port: int, force: bool = False) -> list[tuple[PortEntry, bool, str
             ok = completed.returncode == 0
             msg = (_decode(completed.stdout) or _decode(completed.stderr) or "").strip()
             first = msg.splitlines()[0] if msg else ("ok" if ok else "failed")
+            if not ok and ("denied" in first.lower() or "拒绝" in first or "access" in first.lower()):
+                first = f"{first} (try running as Administrator)"
             results.append(
                 (PortEntry("", "", port, pid, ""), ok, first)
             )

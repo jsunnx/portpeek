@@ -58,23 +58,33 @@ Requires Python **3.9+**.
 | Linux | `ss -tulnp` + `/proc` |
 | macOS | `lsof` |
 
-Windows is fully supported. Linux/macOS are best-effort and may miss edge cases (restricted processes, missing tools in PATH).
+Windows is fully supported. Linux/macOS are best-effort.
 
 ---
 
 ## Usage
 
 ```bash
-portpeek                 # list all LISTEN / bound ports (TCP + UDP)
-portpeek 3000            # inspect one port
-portpeek --all           # not only LISTEN (include ESTABLISHED, etc.)
-portpeek --json          # machine-readable output (ASCII-safe JSON)
-portpeek 3000 --kill     # terminate listening process(es) on 3000
+portpeek                     # list LISTEN / bound ports (TCP + UDP, IPv4 + IPv6)
+portpeek 3000                # inspect one port
+portpeek --pid 1234          # reverse: which ports does this PID hold?
+portpeek --name node         # filter by process name substring
+portpeek --free              # print a free TCP port (from 3000)
+portpeek --free 8000         # free port starting search at 8000
+portpeek --watch 2           # poll until the port state changes
+portpeek --all               # include non-LISTEN states
+portpeek --json              # ASCII-safe JSON
+portpeek 3000 --kill         # terminate listening holders only
 portpeek 3000 --kill --force
-python -m portpeek 8080  # no install needed
+portpeek --no-color          # plain text (CI / pipes)
 ```
 
-`--kill` only targets **listening** holders (not `TIME_WAIT` leftovers). After kill, success is judged by whether the port is still **listening**, not by stray connection states.
+### Kill semantics
+
+- Only **listening** holders are killed (not `TIME_WAIT` leftovers).
+- Windows uses `taskkill /T` (process tree); `--force` adds `/F`.
+- After kill, success means the port is no longer **listening**.
+- Access denied → message suggests running as Administrator.
 
 ---
 
@@ -83,35 +93,44 @@ python -m portpeek 8080  # no install needed
 | You hit this | Run this |
 |--------------|----------|
 | Next / Vite won't start | `portpeek 3000` |
-| Need free ports | `portpeek` |
-| Script needs a yes/no | `portpeek 8080 --json` |
+| Who owns this PID? | `portpeek --pid 4521` |
+| Where is node? | `portpeek --name node` |
+| Need a free port for a script | `portpeek --free` |
+| Script needs JSON | `portpeek 8080 --json` |
 | You must use that port | `portpeek 8080 --kill` |
-| Stubborn leftover | `portpeek 8080 --kill --force` |
 
 ---
 
 ## Design notes
 
-- **Zero third-party deps**: stdlib + system tools
-- **Read-only by default**: killing requires an explicit `--kill`
-- **IPv4 + IPv6 kept separate**: dual-stack binds are not merged away
-- **UDP included**: Windows UDP rows have no State column; they are treated as bound/listening
-- **Process tree kill**: Windows uses `taskkill /T` (and `/F` with `--force`)
-- **JSON is portable**: `ensure_ascii=True` so redirected output stays valid on GBK consoles
-- **No elevation tricks**: if you lack rights, it fails cleanly
+- **Zero third-party deps**
+- **Read-only by default**: `--kill` is explicit
+- **IPv4 + IPv6 kept separate** (dual-stack not merged)
+- **UDP included**: Windows UDP rows have no State column
+- **Portable JSON**: `ensure_ascii=True`
+- **UTF-8 console** on Windows for process names
 
 ---
 
 ## Library API
 
 ```python
-from portpeek import list_ports, find_port, kill_port
+from portpeek import list_ports, find_port, find_by_pid, find_by_name, next_free_port, kill_port
 
-for e in list_ports():
-    print(e.port, e.pid, e.process_name, e.local_addr)
-
+list_ports()
 find_port(3000)
-kill_port(3000, force=False)  # listening holders only
+find_by_pid(4521)
+find_by_name("node")
+next_free_port(3000)
+kill_port(3000, force=False)
+```
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ---
