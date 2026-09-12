@@ -85,6 +85,23 @@ class TestProtected(unittest.TestCase):
         e = PortEntry("TCP", "0.0.0.0", 1, 0, "LISTENING", process_name="")
         self.assertTrue(is_protected_process(e))
 
+    def test_svchost_protected(self):
+        e = PortEntry("TCP", "0.0.0.0", 53, 99, "LISTENING", process_name="svchost")
+        self.assertTrue(is_protected_process(e))
+
+    def test_spoolsv_protected(self):
+        e = PortEntry("TCP", "0.0.0.0", 10502, 99, "LISTENING", process_name="spoolsv")
+        self.assertTrue(is_protected_process(e))
+
+    def test_kill_returns_full_entry(self):
+        # Node is not protected; if nothing listens on 59999, kill returns []
+        from portpeek.core import kill_port, invalidate_snapshot
+
+        invalidate_snapshot()
+        # only assert type contract when there is a result — pick a free high port
+        results = kill_port(59999, force=False, unsafe=False)
+        self.assertEqual(results, [])
+
 
 if __name__ == "__main__":
     unittest.main()

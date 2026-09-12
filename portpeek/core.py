@@ -6,8 +6,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, asdict
 from typing import Iterable
+
+
+class ToolMissing(RuntimeError):
+    """Raised when netstat/ss/lsof/powershell is not on PATH."""
 
 
 @dataclass
@@ -56,6 +61,9 @@ _SS_USER_PID = re.compile(r"pid=(\d+)")
 # After _SS_LINE strips users:(( ... )), body looks like: "name",pid=456,fd=6
 _SS_USER_NAME = re.compile(r'"([^"]+)"')
 
+_SNAPSHOT_TTL = 0.8
+_snapshot: tuple[float, list[PortEntry]] | None = None
+
 
 def _decode(data: bytes) -> str:
     for enc in ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1"):
@@ -66,14 +74,23 @@ def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _hidden_run(cmd: list[str]) -> tuple[int, str]:
+def _hidden_run(cmd: list[str], timeout: float | None = 15.0) -> tuple[int, str]:
     creationflags = 0x08000000 if sys.platform == "win32" else 0
-    raw = subprocess.run(
-        cmd,
-        capture_output=True,
-        creationflags=creationflags,
-        check=False,
-    )
+    try:
+        raw = subprocess.run(
+            cmd,
+            capture_output=True,
+            creationflags=creationflags,
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError as e:
+        raise ToolMissing(
+            f"Required tool '{cmd[0]}' was not found on PATH. "
+            f"Install it or use a supported OS."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise ToolMissing(f"'{' '.join(cmd)}' timed out after {timeout}s") from e
     return raw.returncode, _decode(raw.stdout)
 
 
@@ -81,7 +98,6 @@ def _split_host_port(addr: str) -> tuple[str, int] | None:
     if not addr or addr == "*:*":
         return None
     if addr.startswith("["):
-        # [::]:8080 or [::1]:8080
         close = addr.find("]")
         if close < 0 or close + 1 >= len(addr) or addr[close + 1] != ":":
             return None
@@ -123,7 +139,6 @@ def _parse_windows_netstat() -> list[PortEntry]:
             if not hp:
                 continue
             host, port = hp
-            # Windows UDP has no State; treat bound socket as listening
             entries.append(
                 PortEntry(
                     proto=mu.group("proto").upper(),
@@ -146,19 +161,16 @@ def _parse_linux_ss() -> list[PortEntry]:
             continue
         netid = m.group("netid").upper()
         state = m.group("state").upper()
-        # LISTEN for TCP; UNCONN is normal for UDP listeners
         if netid.startswith("TCP") and state not in {"LISTEN", "LISTENING"}:
             continue
-        if netid.startswith("UDP") and state not in {"UNCONN", "UNCONNECTED", "LISTEN", "LISTENING"}:
+        if netid.startswith("UDP") and state not in {
+            "UNCONN",
+            "UNCONNECTED",
+            "LISTEN",
+            "LISTENING",
+        }:
             continue
-        local = m.group("local")
-        # ss may show *:22 or 0.0.0.0:22 or [::]:22
-        if local.startswith("["):
-            hp = _split_host_port(local)
-        elif ":" not in local:
-            continue
-        else:
-            hp = _split_host_port(local)
+        hp = _split_host_port(m.group("local"))
         if not hp:
             continue
         host, port = hp
@@ -178,19 +190,14 @@ def _parse_linux_ss() -> list[PortEntry]:
 
 def _parse_macos_lsof() -> list[PortEntry]:
     entries: list[PortEntry] = []
-    # TCP listeners
     _, tcp_text = _hidden_run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
-    # UDP
     _, udp_text = _hidden_run(["lsof", "-nP", "-iUDP"])
     for proto, text in (("TCP", tcp_text), ("UDP", udp_text)):
         for line in text.splitlines()[1:]:
             parts = line.split()
             if len(parts) < 9:
                 continue
-            # NAME column often like *:8080 or 127.0.0.1:8080
             name = parts[8]
-            if ":" not in name:
-                continue
             hp = _split_host_port(name)
             if not hp:
                 continue
@@ -217,7 +224,6 @@ def _parse_system() -> list[PortEntry]:
         return _parse_windows_netstat()
     if sys.platform == "darwin":
         return _parse_macos_lsof()
-    # Linux and other POSIX
     return _parse_linux_ss()
 
 
@@ -234,9 +240,7 @@ def _process_map(pids: Iterable[int]) -> dict[int, tuple[str, str]]:
             "Get-Process | Select-Object Id,ProcessName,Path | "
             "ConvertTo-Json -Compress"
         )
-        _, raw = _hidden_run(
-            ["powershell", "-NoProfile", "-Command", cmd]
-        )
+        _, raw = _hidden_run(["powershell", "-NoProfile", "-Command", cmd], timeout=20)
         raw = raw.strip()
         if raw:
             try:
@@ -264,27 +268,15 @@ def _process_map(pids: Iterable[int]) -> dict[int, tuple[str, str]]:
             except OSError:
                 name = ""
         else:
-            # macOS / other
             _, out = _hidden_run(["ps", "-p", str(pid), "-o", "comm="])
             name = out.strip()
         info[pid] = (name, path)
     return info
 
 
-def list_ports(
-    listen_only: bool = True,
-    include_pids: set[int] | None = None,
-) -> list[PortEntry]:
+def _scan_resolved() -> list[PortEntry]:
+    """One full scan: netstat/ss + process map + dedupe."""
     entries = _parse_system()
-    if listen_only:
-        entries = [
-            e
-            for e in entries
-            if e.state in {"LISTENING", "LISTEN"} or e.proto.upper().startswith("UDP")
-        ]
-    if include_pids is not None:
-        entries = [e for e in entries if e.pid in include_pids]
-
     pmap = _process_map(e.pid for e in entries)
     for e in entries:
         name, path = pmap.get(e.pid, ("", ""))
@@ -292,8 +284,6 @@ def list_ports(
             e.process_name = name
         if path:
             e.exe_path = path
-
-    # Keep IPv4 and IPv6 as separate rows
     seen: set[tuple[str, str, int, int]] = set()
     uniq: list[PortEntry] = []
     for e in entries:
@@ -306,31 +296,74 @@ def list_ports(
     return uniq
 
 
-def find_port(port: int, listen_only: bool = True) -> list[PortEntry]:
-    return [e for e in list_ports(listen_only=listen_only) if e.port == port]
+def invalidate_snapshot() -> None:
+    """Drop cached scan (call after kill / when freshness matters)."""
+    global _snapshot
+    _snapshot = None
 
 
-def find_by_pid(pid: int, listen_only: bool = True) -> list[PortEntry]:
-    """Reverse lookup: which ports does this PID hold?"""
-    return [e for e in list_ports(listen_only=listen_only) if e.pid == pid]
+def list_ports(
+    listen_only: bool = True,
+    include_pids: set[int] | None = None,
+    use_cache: bool = True,
+) -> list[PortEntry]:
+    global _snapshot
+    now = time.monotonic()
+    if use_cache and _snapshot is not None and now - _snapshot[0] < _SNAPSHOT_TTL:
+        base = list(_snapshot[1])
+    else:
+        base = _scan_resolved()
+        # Stamp AFTER the scan so a slow netstat/PowerShell does not age out immediately
+        _snapshot = (time.monotonic(), list(base))
+
+    entries = base
+    if listen_only:
+        entries = [
+            e
+            for e in entries
+            if e.state in {"LISTENING", "LISTEN"} or e.proto.upper().startswith("UDP")
+        ]
+    if include_pids is not None:
+        entries = [e for e in entries if e.pid in include_pids]
+    return list(entries)
 
 
-def find_by_name(name: str, listen_only: bool = True) -> list[PortEntry]:
-    """Case-insensitive substring match on process name or exe path."""
+def find_port(
+    port: int, listen_only: bool = True, use_cache: bool = True
+) -> list[PortEntry]:
+    return [
+        e
+        for e in list_ports(listen_only=listen_only, use_cache=use_cache)
+        if e.port == port
+    ]
+
+
+def find_by_pid(
+    pid: int, listen_only: bool = True, use_cache: bool = True
+) -> list[PortEntry]:
+    return [
+        e
+        for e in list_ports(listen_only=listen_only, use_cache=use_cache)
+        if e.pid == pid
+    ]
+
+
+def find_by_name(
+    name: str, listen_only: bool = True, use_cache: bool = True
+) -> list[PortEntry]:
     needle = (name or "").lower()
     if not needle:
         return []
     out: list[PortEntry] = []
-    for e in list_ports(listen_only=listen_only):
+    for e in list_ports(listen_only=listen_only, use_cache=use_cache):
         hay = f"{e.process_name} {e.exe_path}".lower()
         if needle in hay:
             out.append(e)
     return out
 
 
-# Critical OS processes — never taskkill by default
-PROTECTED_PIDS_WIN = {0, 4}  # Idle, System
-PROTECTED_NAMES = {
+# Platform-specific protected names. Do not share dwm/csrss with Linux.
+PROTECTED_NAMES_WIN = {
     "system",
     "registry",
     "smss",
@@ -345,24 +378,55 @@ PROTECTED_NAMES = {
     "system idle process",
     "fontdrvhost",
     "dwm",
+    "svchost",
+    "spoolsv",
+    "alg",
+    "lsm",
 }
+PROTECTED_NAMES_POSIX = {
+    "init",
+    "systemd",
+    "kthreadd",
+    "ksoftirqd",
+    "migration",
+    "rcu_",
+}
+# Back-compat alias (Windows-only list)
+PROTECTED_NAMES = PROTECTED_NAMES_WIN
+PROTECTED_PIDS_WIN = {0, 4}
+
+
+def _basename_name(entry: PortEntry) -> str:
+    name = (entry.process_name or "").strip().lower()
+    if not name:
+        name = (entry.exe_path or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
 
 def is_protected_process(entry: PortEntry) -> bool:
     """True if this listener must not be killed by default."""
-    # PID 0 is never a killable user process (Idle on Windows, swapper/null on Linux)
     if entry.pid == 0:
         return True
-    if sys.platform == "win32" and entry.pid in PROTECTED_PIDS_WIN:
-        return True
-    name = (entry.process_name or "").strip().lower()
+    if sys.platform == "win32":
+        if entry.pid == 4:
+            return True
+        names = PROTECTED_NAMES_WIN
+    else:
+        if entry.pid == 1:
+            return True
+        names = PROTECTED_NAMES_POSIX
+    name = _basename_name(entry)
     if not name:
-        # path basename fallback
-        name = (entry.exe_path or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower()
-    if name.endswith(".exe"):
-        name = name[:-4]
-    if name in PROTECTED_NAMES:
+        return False
+    if name in names:
         return True
+    # kernel thread prefixes on Linux
+    if sys.platform.startswith("linux"):
+        for pref in PROTECTED_NAMES_POSIX:
+            if name.startswith(pref):
+                return True
     return False
 
 
@@ -379,10 +443,16 @@ def _ss_users_from_line(m: re.Match) -> tuple[int, str]:
     return pid, name
 
 
-def next_free_port(start: int = 3000, end: int = 10000) -> int | None:
-    """First free TCP port in [start, end). One netstat/ss snapshot."""
+def next_free_port(start: int = 3000, end: int | None = None) -> int | None:
+    """First free TCP port in [start, end). TOCTOU: another process may steal it."""
     import socket
 
+    if end is None:
+        end = min(start + 5000, 65536)
+    end = min(end, 65536)
+    start = max(1, start)
+    if start >= end:
+        return None
     used = {e.port for e in list_ports(listen_only=True)}
     for port in range(start, end):
         if port in used:
@@ -418,12 +488,10 @@ def kill_port(
     force: bool = False,
     unsafe: bool = False,
 ) -> list[tuple[PortEntry, bool, str]]:
-    """Kill listening holders. Skips protected OS processes unless unsafe=True.
-
-    Admin permission hint is applied by the CLI layer only.
-    """
+    """Kill listening holders. Returns full PortEntry for each PID handled."""
     results: list[tuple[PortEntry, bool, str]] = []
-    hits = find_port(port, listen_only=True)
+    # Fresh scan — do not trust a half-second-old snapshot after other kills
+    hits = find_port(port, listen_only=True, use_cache=False)
     if not hits:
         return results
 
@@ -446,15 +514,14 @@ def kill_port(
             continue
         if sys.platform == "win32":
             ok, first = _taskkill(pid, force)
-            results.append((PortEntry("", "", port, pid, ""), ok, first))
+            results.append((entry, ok, first))
         else:
             args = ["kill", "-9" if force else "-15", str(pid)]
             completed = subprocess.run(args, capture_output=True, check=False)
             ok = completed.returncode == 0
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-            results.append(
-                (PortEntry("", "", port, pid, ""), ok, stderr or ("ok" if ok else "failed"))
-            )
+            results.append((entry, ok, stderr or ("ok" if ok else "failed")))
+    invalidate_snapshot()
     return results
 
 
@@ -463,7 +530,6 @@ def kill_ports(
     force: bool = False,
     unsafe: bool = False,
 ) -> list[tuple[int, PortEntry, bool, str]]:
-    """Kill multiple ports. Returns (port, entry, ok, message)."""
     out: list[tuple[int, PortEntry, bool, str]] = []
     for port in ports:
         for entry, ok, msg in kill_port(port, force=force, unsafe=unsafe):

@@ -9,10 +9,12 @@ import time
 from . import __version__
 from .core import (
     PortEntry,
+    ToolMissing,
     entries_to_json,
     find_by_name,
     find_by_pid,
     find_port,
+    invalidate_snapshot,
     is_protected_process,
     kill_port,
     kill_ports,
@@ -170,7 +172,8 @@ def _do_kill(ports: list[int], force: bool, unsafe: bool) -> int:
         return 2
     any_live = False
     for port in ports:
-        before = find_port(port, listen_only=True)
+        invalidate_snapshot()
+        before = find_port(port, listen_only=True, use_cache=False)
         if not before:
             print(f"No listening process found on port {port}.")
             continue
@@ -195,7 +198,8 @@ def _do_kill(ports: list[int], force: bool, unsafe: bool) -> int:
             else:
                 failed += 1
                 print(f"  fail  {_admin_hint(msg)}")
-        after = find_port(port, listen_only=True)
+        invalidate_snapshot()
+        after = find_port(port, listen_only=True, use_cache=False)
         remaining_killable = [e for e in after if not is_protected_process(e)]
         if skipped and not remaining_killable and failed == 0:
             print(
@@ -313,23 +317,52 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_color:
         _C.update({"g": "", "y": "", "d": "", "r": "", "b": "", "e": ""})
 
+    out_f = None
+    if args.output:
+        out_f = open(args.output, "w", encoding="utf-8", newline="\n")
+
     def emit(text: str, machine: bool = False) -> None:
-        if args.output:
-            with open(args.output, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text if text.endswith("\n") else text + "\n")
+        if out_f is not None:
+            out_f.write(text if text.endswith("\n") else text + "\n")
+            out_f.flush()
             if not machine:
                 print(f"Wrote {args.output}")
             return
         _emit(text, force_utf8=machine)
 
-    listen_only = not args.all
+    try:
+        return _run(args, emit, listen_only=not args.all)
+    except ToolMissing as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    finally:
+        if out_f is not None:
+            out_f.close()
 
+
+def _run(args, emit, listen_only: bool) -> int:
     if args.free is not None:
-        port = next_free_port(start=args.free, end=args.free + 5000)
+        free_end = min(args.free + 5000, 65536)
+        port = next_free_port(start=args.free, end=free_end)
         if port is None:
-            print(f"No free port found in [{args.free}, {args.free + 5000}).")
+            print(f"No free port found in [{args.free}, {free_end}).")
             return 1
-        emit(str(port), machine=args.json or bool(args.output))
+        if args.json or args.output:
+            import json as _json
+
+            payload = _json.dumps(
+                {
+                    "schema_version": 1,
+                    "count": 1,
+                    "free_port": port,
+                    "entries": [],
+                },
+                ensure_ascii=True,
+                indent=2,
+            )
+            emit(payload, machine=True)
+        else:
+            emit(str(port), machine=False)
         return 0
 
     if args.watch is not None:
@@ -341,7 +374,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Watching port {watch_port} every {args.watch}s (Ctrl+C to stop)...")
         try:
             while True:
-                hits = find_port(watch_port, listen_only=True)
+                invalidate_snapshot()
+                hits = find_port(watch_port, listen_only=True, use_cache=False)
                 snap = tuple(sorted((e.pid, e.process_name, e.local_addr) for e in hits))
                 if snap != last:
                     if last is not None:
@@ -357,7 +391,9 @@ def main(argv: list[str] | None = None) -> int:
         return _do_kill(args.ports, force=args.force, unsafe=args.unsafe)
 
     if args.pid is not None:
-        entries = _sort_entries(find_by_pid(args.pid, listen_only=listen_only), args.sort)
+        entries = _sort_entries(
+            find_by_pid(args.pid, listen_only=listen_only), args.sort
+        )
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
@@ -369,7 +405,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.name is not None:
-        entries = _sort_entries(find_by_name(args.name, listen_only=listen_only), args.sort)
+        entries = _sort_entries(
+            find_by_name(args.name, listen_only=listen_only), args.sort
+        )
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1
@@ -381,8 +419,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if len(args.ports) == 1:
-        entries = find_port(args.ports[0], listen_only=listen_only)
-        entries = _sort_entries(entries, args.sort)
+        entries = _sort_entries(
+            find_port(args.ports[0], listen_only=listen_only), args.sort
+        )
         if args.json or args.output:
             emit(entries_to_json(entries), machine=True)
             return 0 if entries else 1

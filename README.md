@@ -126,10 +126,13 @@ JSON shape (`schema_version` is stable for scripts):
 
 `--kill` **never** targets critical OS processes by default:
 
-`System` (PID 4), `Idle`, `lsass`, `csrss`, `smss`, `wininit`, `winlogon`, `services`, `Registry`, `Memory Compression`, `dwm`, …
+Windows: `System` (PID 4), `Idle`, `lsass`, `csrss`, `smss`, `wininit`, `winlogon`, `services`, `Registry`, `Memory Compression`, `dwm`, **`svchost`**, **`spoolsv`**, …  
+POSIX: PID 0/1, `init`, `systemd`, kernel threads.
 
 If only a protected process holds the port, you get a clear skip message.  
 Override only with `--unsafe` (combine with `--force` if needed) — you can blue-screen or lock yourself out. Don't.
+
+Snapshots are reused for ~0.8s so multi-port / kill paths do not re-run `netstat`+PowerShell for every call. `--kill` and `--watch` force a fresh scan when needed.
 
 ### JSON / redirect notes (Windows)
 
